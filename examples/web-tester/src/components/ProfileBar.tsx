@@ -12,7 +12,15 @@ type Props = {
 
 export function ProfileBar({ profiles, activeId, onSwitch, onCreate, onDelete }: Props) {
   const [newName, setNewName] = useState('');
+  const [copied, setCopied] = useState(false);
   const active = profiles.find((p) => p.id === activeId) ?? null;
+
+  const copyCommitment = async () => {
+    if (!active) return;
+    await navigator.clipboard.writeText(active.commitment);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  };
 
   return (
     <div className="border-b border-zinc-800 bg-zinc-900/60 px-4 py-3 flex items-center gap-3 flex-wrap">
@@ -37,9 +45,20 @@ export function ProfileBar({ profiles, activeId, onSwitch, onCreate, onDelete }:
       )}
       {active && (
         <>
-          <span className="text-xs text-zinc-400 font-mono">
-            commitment: {active.commitment.slice(0, 12)}…{active.commitment.slice(-6)}
-          </span>
+          <button
+            type="button"
+            onClick={copyCommitment}
+            title={`Click to copy full commitment\n${active.commitment}`}
+            className="text-xs text-zinc-400 font-mono inline-flex items-center gap-1 hover:text-zinc-100"
+          >
+            <span className="text-zinc-500">commitment:</span>
+            <span>
+              {active.commitment.slice(0, 14)}…{active.commitment.slice(-8)}
+            </span>
+            <span className={`ml-1 ${copied ? 'text-emerald-400' : 'text-indigo-400'}`}>
+              {copied ? '✓ copied' : 'copy'}
+            </span>
+          </button>
           <Button
             variant="ghost"
             onClick={() => {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { MidenClient } from '@miden-sdk/miden-sdk';
 import type {
   Multisig,
@@ -54,10 +54,21 @@ export default function App() {
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [status, setStatus] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
-  // True while bundle init / discover / auto-load is in flight. While true we
-  // suppress the SetupPanel so the user can't fire Create before discovery
-  // tells us whether a multisig already exists for this profile.
+  // True while the bundle (MidenClient + MultisigClient) is being constructed.
+  // We hide the SetupPanel only during this short window - until the bundle is
+  // ready, neither Create nor Load can do anything anyway.
   const [bootstrapping, setBootstrapping] = useState<boolean>(false);
+  // True while Guardian discovery (`recoverByKey`) is running. We DO render the
+  // SetupPanel during this phase so the user can create or load without waiting
+  // for the discovery (which can take a while if the WASM is still warming up
+  // or the network is slow). If discovery finds a single multisig later and
+  // the user hasn't loaded one in the meantime, we auto-load it.
+  const [discovering, setDiscovering] = useState<boolean>(false);
+  // Ref kept in sync with `multisig` so async work (discover, auto-load) can
+  // bail out cheaply if the user already created/loaded something while we
+  // were busy talking to the Guardian.
+  const multisigRef = useRef<Multisig | null>(null);
+  useEffect(() => { multisigRef.current = multisig; }, [multisig]);
 
   const activeProfile = profiles.find((p) => p.id === activeId) ?? null;
 
@@ -106,6 +117,9 @@ export default function App() {
         const newBundle: ClientBundle = { midenClient, multisigClient, guardianCommitment };
         setBundle(newBundle);
         setStatus(`Ready. Guardian commitment: ${guardianCommitment.slice(0, 16)}…`);
+        // Unblock the SetupPanel here. The user shouldn't have to wait for the
+        // Guardian round-trip below before being able to click Create / Load.
+        setBootstrapping(false);
 
         // Decide which accountId (if any) to auto-load. We try, in order:
         //   1. `lastAccountId` persisted on the profile (this profile did
@@ -118,6 +132,7 @@ export default function App() {
         //        pick one with "Load existing" rather than guess.
         let targetAccountId: string | null = activeProfile.lastAccountId ?? null;
         if (!targetAccountId) {
+          setDiscovering(true);
           try {
             const matches = await discoverAccountsForProfile(multisigClient, activeProfile);
             if (cancelled) return;
@@ -135,15 +150,19 @@ export default function App() {
             // from using Create / Load. Surface as a status note, not an error.
             log.warn('discoverAccountsForProfile failed', (e as Error).message);
             setStatus(`Could not discover multisigs for ${activeProfile.name}: ${(e as Error).message}`);
+          } finally {
+            if (!cancelled) setDiscovering(false);
           }
         }
 
-        if (targetAccountId) {
+        // Skip auto-load if the user already created/loaded a multisig while
+        // discovery was in flight - we don't want to clobber their work.
+        if (targetAccountId && !multisigRef.current) {
           log.info('auto-loading multisig', { accountId: targetAccountId });
           setStatus(`Reloading ${targetAccountId}…`);
           try {
             const m = await loadMultisig(multisigClient, activeProfile, targetAccountId);
-            if (cancelled) return;
+            if (cancelled || multisigRef.current) return;
             setMultisig(m);
             // Persist so the next switch / reload reuses lastAccountId fast-path.
             if (targetAccountId !== activeProfile.lastAccountId) {
@@ -459,17 +478,34 @@ export default function App() {
           </svg>
           <div className="text-sm">{status || 'Loading…'}</div>
           <div className="text-xs text-zinc-500">
-            Checking the Guardian for any multisig that involves this profile…
+            Initializing the Miden client (downloads ~4 MB of WASM the first time).
           </div>
         </div>
       ) : !multisig ? (
-        <SetupPanel
-          myCommitment={activeProfile.commitment}
-          guardianCommitment={bundle.guardianCommitment}
-          busy={busyKey === 'create' || busyKey === 'load'}
-          onCreate={handleCreateMultisig}
-          onLoad={handleLoadMultisig}
-        />
+        <>
+          {discovering && (
+            <div className="mx-4 mt-3 mb-2 flex items-center gap-2 rounded border border-indigo-900/60 bg-indigo-950/30 px-3 py-2 text-xs text-indigo-200">
+              <svg
+                className="animate-spin h-3.5 w-3.5"
+                xmlns="http://www.w3.org/2000/svg"
+                fill="none"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+              </svg>
+              Searching the Guardian for any multisig that involves this profile - you can create or load one already.
+            </div>
+          )}
+          <SetupPanel
+            myCommitment={activeProfile.commitment}
+            guardianCommitment={bundle.guardianCommitment}
+            busy={busyKey === 'create' || busyKey === 'load'}
+            onCreate={handleCreateMultisig}
+            onLoad={handleLoadMultisig}
+          />
+        </>
       ) : (
         <MultisigPanel
           multisig={multisig}
