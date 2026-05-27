@@ -214,7 +214,7 @@ export default function App() {
   }, [activeProfile?.id, settings.guardianEndpoint, settings.midenRpcUrl]);
 
   const refresh = useCallback(async (m: Multisig) => {
-    if (!bundle) return;
+    if (!bundle) return null;
     log.debug('refresh start', { accountId: m.accountId });
     const result = await syncAll(bundle.midenClient, m);
     setProposals(result.proposals);
@@ -225,6 +225,7 @@ export default function App() {
       setError(`Partial sync (${result.errors.length} issue(s)): ${reasons}`);
     }
     log.debug('refresh done', { proposals: result.proposals.length, notes: result.notes.length, errors: result.errors.length });
+    return result;
   }, [bundle]);
 
   const handleSwitch = (id: string) => {
@@ -372,8 +373,18 @@ export default function App() {
     setBusyKey('sync');
     setError(null);
     try {
-      await refresh(multisig);
-      setStatus('Synced.');
+      const result = await refresh(multisig);
+      if (result) {
+        const okSteps = ['midenSync', 'syncState', 'syncProposals', 'notes'].filter(
+          (s) => !result.errors.find((e) => e.step === s),
+        );
+        setStatus(
+          `Synced. ${result.proposals.length} proposal(s), ${result.notes.length} note(s). ` +
+          `(${okSteps.length}/4 steps ok)`,
+        );
+      } else {
+        setStatus('Synced.');
+      }
     } catch (e) {
       const err = e as Error;
       log.error('sync failed', err);
