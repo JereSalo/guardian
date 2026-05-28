@@ -13,6 +13,7 @@ import { ProfileBar } from '@/components/ProfileBar';
 import { Settings } from '@/components/Settings';
 import { SetupPanel } from '@/components/SetupPanel';
 import { MultisigPanel } from '@/components/MultisigPanel';
+import { Button } from '@/components/Button';
 import {
   listProfiles,
   createProfile,
@@ -76,6 +77,8 @@ export default function App() {
   // We hide the SetupPanel only during this short window - until the bundle is
   // ready, neither Create nor Load can do anything anyway.
   const [bootstrapping, setBootstrapping] = useState<boolean>(false);
+  // Bump to force a re-init of the client bundle (Retry after a failed init).
+  const [reloadNonce, setReloadNonce] = useState<number>(0);
   // True while Guardian discovery (`recoverByKey`) is running. We DO render the
   // SetupPanel during this phase so the user can create or load without waiting
   // for the discovery (which can take a while if the WASM is still warming up
@@ -255,7 +258,7 @@ export default function App() {
     // so updates to mutable fields like `lastAccountId` don't trigger a full
     // bundle rebuild (which would unload the live multisig).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeProfile?.id, settings.guardianEndpoint, settings.midenRpcUrl]);
+  }, [activeProfile?.id, settings.guardianEndpoint, settings.midenRpcUrl, reloadNonce]);
 
   // `'updated'` means: I just changed state for an account I have loaded (sign,
   // execute, propose). Other tabs already on the same accountId should refresh.
@@ -692,7 +695,7 @@ export default function App() {
         <div className="px-4 py-12 text-center text-zinc-500">
           Create a profile to start.
         </div>
-      ) : bootstrapping || !bundle ? (
+      ) : bootstrapping || (!bundle && !error) ? (
         <div className="px-4 py-12 flex flex-col items-center gap-3 text-zinc-400">
           <svg
             className="animate-spin h-6 w-6 text-indigo-400"
@@ -712,6 +715,15 @@ export default function App() {
           <div className="text-xs text-zinc-500">
             Initializing the Miden client (downloads ~4 MB of WASM the first time).
           </div>
+        </div>
+      ) : !bundle ? (
+        <div className="px-4 py-12 flex flex-col items-center gap-3 text-center">
+          <span className="text-sm text-red-400">⚠ Couldn't initialize clients</span>
+          <span className="max-w-md break-words text-xs text-zinc-500">{error}</span>
+          <span className="text-xs text-zinc-500">
+            Check the Guardian / Miden RPC settings above, then retry.
+          </span>
+          <Button onClick={() => setReloadNonce((n) => n + 1)}>Retry</Button>
         </div>
       ) : !multisig ? (
         <>

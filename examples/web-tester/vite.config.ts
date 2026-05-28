@@ -11,6 +11,9 @@ const DEV_GUARDIAN_TARGET =
   process.env.VITE_DEV_GUARDIAN_TARGET ?? 'https://miden-guardian-staging-01.tail48b4d.ts.net';
 
 export default defineConfig({
+  // Served under /ui on the deployed host so it can co-exist with the Guardian
+  // API at the domain root. Asset URLs are emitted with this prefix.
+  base: '/ui/',
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {

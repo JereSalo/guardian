@@ -6,10 +6,11 @@ export type Settings = {
 };
 
 const DEFAULT_SETTINGS: Settings = {
-  // Default to the Vite dev-server proxy path. Avoids CORS against the staging
-  // Guardian (which does not send Access-Control-Allow-Origin headers).
-  // For a non-localhost Guardian deployment with CORS enabled, set the
-  // absolute URL here.
+  // Relative path proxied by the reverse proxy in front of this UI (Caddy in a
+  // deployed setup, Vite's server.proxy in dev) to the Guardian. Keeping it
+  // relative makes UI and Guardian same-origin, so there is no CORS to manage.
+  // Editable in the UI to point at any absolute Guardian URL whose CORS allows
+  // this origin.
   guardianEndpoint: '/guardian-proxy',
   midenRpcUrl: 'https://rpc.testnet.miden.io',
 };
