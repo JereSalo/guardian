@@ -143,7 +143,6 @@ export async function syncAll(
     errors.push({ step: 'syncProposals', message: msg });
     streamed = multisig.listProposals();
   }
-  const proposals = streamed.filter((p) => p.status !== 'finalized');
   // History sources, merged:
   //   1. Local SDK state (`multisig.listProposals()`): proposals finalized in
   //      this in-memory instance (i.e. executed during this session).
@@ -165,6 +164,17 @@ export async function syncAll(
     ? loadCachedHistory(cacheKeys.guardianEndpoint, cacheKeys.midenRpcEndpoint, multisig.accountId)
     : [];
   const history = mergeHistory(cached, live);
+  // Filter out proposals that are already in history. Cross-tab scenario:
+  // tab B executes a proposal and caches it as finalized in localStorage. Tab
+  // A still has the proposal as 'ready' in its in-memory map because
+  // syncProposals({skipInvalid:true}) silently drops the finalization delta
+  // (verifyProposalMetadataBinding cannot reconstruct tx_summary post-
+  // finalization). Without this filter, tab A would show the same proposal in
+  // both Pending and History after the broadcast refresh.
+  const finalizedIds = new Set(history.map((p) => p.id.toLowerCase()));
+  const proposals = streamed.filter(
+    (p) => p.status !== 'finalized' && !finalizedIds.has(p.id.toLowerCase()),
+  );
 
   log.debug('sync: multisig.getConsumableNotes()');
   let notes: ConsumableNote[] = [];
