@@ -25,11 +25,6 @@ type Props = {
   onUnload: () => void;
 };
 
-function short(hex: string, head = 10, tail = 6): string {
-  if (hex.length <= head + tail + 3) return hex;
-  return `${hex.slice(0, head)}…${hex.slice(-tail)}`;
-}
-
 function formatRelativeTime(iso: string | undefined | null): string {
   if (!iso) return '';
   const t = Date.parse(iso);
@@ -105,8 +100,8 @@ export function MultisigPanel({
           <div className="space-y-0.5 pt-2">
             <div className="text-zinc-500 text-xs uppercase tracking-wide">Cosigners</div>
             {multisig.signerCommitments.map((c) => (
-              <div key={c} className="font-mono text-xs">
-                {short(c, 16, 8)}
+              <div key={c} className="font-mono text-xs break-all">
+                {c}
                 {isMine(c) && (
                   <span className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-indigo-900 text-indigo-200">
                     this profile
@@ -117,7 +112,7 @@ export function MultisigPanel({
           </div>
           <div className="pt-2">
             <span className="text-zinc-500">Guardian:</span>{' '}
-            <span className="font-mono text-xs">{short(multisig.guardianCommitment, 16, 8)}</span>
+            <span className="font-mono text-xs break-all">{multisig.guardianCommitment}</span>
           </div>
           {accountState && (
             <div className="pt-2 text-xs text-zinc-500 space-y-0.5">
@@ -129,8 +124,8 @@ export function MultisigPanel({
               </div>
               <div>
                 <span>Account commitment:</span>{' '}
-                <span className="font-mono text-zinc-400" title={accountState.commitment}>
-                  {short(accountState.commitment, 14, 8)}
+                <span className="font-mono text-zinc-400 break-all">
+                  {accountState.commitment}
                 </span>
               </div>
             </div>
@@ -147,11 +142,11 @@ export function MultisigPanel({
         ) : (
           <div className="space-y-1.5">
             {vaultBalances.map((b) => (
-              <div key={b.faucetId} className="flex items-center justify-between text-sm font-mono">
-                <span className="text-zinc-400" title={b.faucetId}>
-                  faucet {short(b.faucetId, 10, 6)}
+              <div key={b.faucetId} className="flex items-center justify-between gap-3 text-sm font-mono">
+                <span className="text-zinc-400 break-all min-w-0">
+                  faucet {b.faucetId}
                 </span>
-                <span className="text-zinc-100">{b.amount.toString()}</span>
+                <span className="text-zinc-100 shrink-0">{b.amount.toString()}</span>
               </div>
             ))}
           </div>
@@ -165,9 +160,10 @@ export function MultisigPanel({
         ) : (
           <div className="space-y-2">
             {notes.map((n) => (
-              <label key={n.id} className="flex items-center gap-3 text-sm font-mono">
+              <label key={n.id} className="flex items-start gap-3 text-sm font-mono">
                 <input
                   type="checkbox"
+                  className="mt-1 shrink-0"
                   checked={selectedNotes.has(n.id)}
                   onChange={(e) => {
                     setSelectedNotes((prev) => {
@@ -178,9 +174,9 @@ export function MultisigPanel({
                     });
                   }}
                 />
-                <span>{short(n.id, 12, 6)}</span>
-                <span className="text-zinc-400">
-                  {n.assets.map((a) => `${a.amount} (faucet ${short(a.faucetId, 8, 4)})`).join(', ')}
+                <span className="break-all min-w-0">{n.id}</span>
+                <span className="text-zinc-400 break-all min-w-0">
+                  {n.assets.map((a) => `${a.amount} (faucet ${a.faucetId})`).join(', ')}
                 </span>
               </label>
             ))}
@@ -211,17 +207,17 @@ export function MultisigPanel({
               const ready = p.status === 'ready' || collected >= required;
               return (
                 <div key={p.id} className="border border-zinc-800 rounded p-3 bg-zinc-950/50">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="font-mono text-xs">{short(p.id, 16, 8)}</span>
-                    <span className="text-xs text-zinc-400">
+                  <div className="flex items-start justify-between gap-3 mb-2">
+                    <span className="font-mono text-xs break-all min-w-0">{p.id}</span>
+                    <span className="text-xs text-zinc-400 shrink-0">
                       {p.metadata.proposalType} · {collected}/{required}{' '}
                       {ready ? '· READY' : ''}
                     </span>
                   </div>
                   <div className="space-y-0.5 mb-3 text-xs font-mono">
                     {multisig.signerCommitments.map((c) => (
-                      <div key={c}>
-                        {signed.has(c.toLowerCase()) ? '✓' : '·'} {short(c, 14, 6)}
+                      <div key={c} className="break-all">
+                        {signed.has(c.toLowerCase()) ? '✓' : '·'} {c}
                         {isMine(c) && <span className="ml-2 text-indigo-300">(you)</span>}
                       </div>
                     ))}
@@ -258,12 +254,12 @@ export function MultisigPanel({
             {history.map((p) => (
               <div
                 key={p.id}
-                className="flex items-center justify-between border-b border-zinc-800/60 pb-1.5 last:border-0 last:pb-0"
+                className="flex items-start justify-between gap-3 border-b border-zinc-800/60 pb-1.5 last:border-0 last:pb-0"
               >
-                <span className="text-zinc-500">nonce {p.nonce}</span>
-                <span className="text-zinc-400">{describeProposal(p)}</span>
-                <span className="text-zinc-500" title={p.id}>
-                  {short(p.id, 12, 6)}
+                <span className="text-zinc-500 shrink-0">nonce {p.nonce}</span>
+                <span className="text-zinc-400 shrink-0">{describeProposal(p)}</span>
+                <span className="text-zinc-500 break-all min-w-0 text-right">
+                  {p.id}
                 </span>
               </div>
             ))}

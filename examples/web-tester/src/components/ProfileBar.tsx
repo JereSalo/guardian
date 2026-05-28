@@ -48,14 +48,12 @@ export function ProfileBar({ profiles, activeId, onSwitch, onCreate, onDelete }:
           <button
             type="button"
             onClick={copyCommitment}
-            title={`Click to copy full commitment\n${active.commitment}`}
-            className="text-xs text-zinc-400 font-mono inline-flex items-center gap-1 hover:text-zinc-100"
+            title="Click to copy"
+            className="text-xs text-zinc-400 font-mono inline-flex items-center gap-1 hover:text-zinc-100 break-all text-left"
           >
-            <span className="text-zinc-500">commitment:</span>
-            <span>
-              {active.commitment.slice(0, 14)}…{active.commitment.slice(-8)}
-            </span>
-            <span className={`ml-1 ${copied ? 'text-emerald-400' : 'text-indigo-400'}`}>
+            <span className="text-zinc-500 shrink-0">commitment:</span>
+            <span>{active.commitment}</span>
+            <span className={`ml-1 shrink-0 ${copied ? 'text-emerald-400' : 'text-indigo-400'}`}>
               {copied ? '✓ copied' : 'copy'}
             </span>
           </button>

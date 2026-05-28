@@ -95,8 +95,14 @@ export default function App() {
   // own tabs (same browser, same origin) make a state change. Cross-machine
   // updates are picked up by the visibility-based polling further below.
   const broadcastRef = useRef<BroadcastChannel | null>(null);
+  // Refs to the active profile and bundle so the broadcast listener (mounted
+  // once) can read current values without re-installing on every change.
+  const activeProfileRef = useRef<ProfileRecord | null>(null);
+  const bundleRef = useRef<ClientBundle | null>(null);
 
   const activeProfile = profiles.find((p) => p.id === activeId) ?? null;
+  useEffect(() => { activeProfileRef.current = activeProfile; }, [activeProfile]);
+  useEffect(() => { bundleRef.current = bundle; }, [bundle]);
 
   // Initial profile load
   useEffect(() => {
@@ -148,7 +154,7 @@ export default function App() {
         if (cancelled) return;
         const newBundle: ClientBundle = { midenClient, multisigClient, guardianCommitment };
         setBundle(newBundle);
-        setStatus(`Ready. Guardian commitment: ${guardianCommitment.slice(0, 16)}…`);
+        setStatus(`Ready. Guardian commitment: ${guardianCommitment}`);
         // Unblock the SetupPanel here. The user shouldn't have to wait for the
         // Guardian round-trip below before being able to click Create / Load.
         setBootstrapping(false);
@@ -205,7 +211,10 @@ export default function App() {
             }
             // Best-effort sync. Soft errors (stale proposal binding, transient
             // RPC blip) are surfaced but do NOT drop the loaded multisig.
-            const result = await syncAll(midenClient, m);
+            const result = await syncAll(midenClient, m, {
+              guardianEndpoint: settings.guardianEndpoint,
+              midenRpcEndpoint: settings.midenRpcUrl,
+            });
             if (cancelled) return;
             setProposals(result.proposals);
             setHistory(result.history);
@@ -248,8 +257,12 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProfile?.id, settings.guardianEndpoint, settings.midenRpcUrl]);
 
-  const notifyOtherTabs = useCallback((accountId: string) => {
-    broadcastRef.current?.postMessage({ type: 'updated', accountId });
+  // `'updated'` means: I just changed state for an account I have loaded (sign,
+  // execute, propose). Other tabs already on the same accountId should refresh.
+  // `'created'` means: I just created a brand new multisig. Other tabs with no
+  // multisig loaded should re-run discovery in case they're a cosigner.
+  const notifyOtherTabs = useCallback((type: 'updated' | 'created', accountId: string) => {
+    broadcastRef.current?.postMessage({ type, accountId });
   }, []);
 
   // All refreshes - manual and auto - go through this single inflight lock so
@@ -268,7 +281,10 @@ export default function App() {
     }
     const run = (async () => {
       log.debug('refresh start', { accountId: m.accountId });
-      const result = await syncAll(bundle.midenClient, m);
+      const result = await syncAll(bundle.midenClient, m, {
+        guardianEndpoint: settings.guardianEndpoint,
+        midenRpcEndpoint: settings.midenRpcUrl,
+      });
       // If the user unloaded, switched profile or loaded a different account
       // while we were syncing, drop the result so we don't clobber the new
       // state with stale data from the previous account.
@@ -312,7 +328,7 @@ export default function App() {
     } finally {
       if (inflightRefreshRef.current === run) inflightRefreshRef.current = null;
     }
-  }, [bundle]);
+  }, [bundle, settings.guardianEndpoint, settings.midenRpcUrl]);
 
   // Auto refresh (broadcast + visibility poll) skips entirely when something
   // else (manual sync, sign, execute, or another auto tick) is in flight.
@@ -324,25 +340,66 @@ export default function App() {
     await refresh(m);
   }, [refresh]);
 
-  // Listen for cross-tab "updated" broadcasts. When another tab (same browser,
-  // same origin) signs/executes/proposes on the same multisig, refresh ours
-  // automatically. Cross-machine updates are covered by the polling effect below.
+  // Listen for cross-tab broadcasts. Two kinds:
+  // - 'updated': a peer changed state for the same multisig we have loaded
+  //   (sign, execute, propose). We refresh ours automatically.
+  // - 'created': a peer created a brand-new multisig. If we don't have one
+  //   loaded, run discovery for the active profile and auto-load on match.
+  // Cross-machine updates are covered by the polling effect below.
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') return;
     const channel = new BroadcastChannel('miden-multisig-sync');
     broadcastRef.current = channel;
     channel.onmessage = (ev) => {
       const data = ev.data as { type?: string; accountId?: string } | null;
-      const m = multisigRef.current;
-      if (!data || data.type !== 'updated' || !m || data.accountId !== m.accountId) return;
-      log.info('broadcast: peer reports update, refreshing');
-      void autoRefresh();
+      if (!data) return;
+      if (data.type === 'updated') {
+        const m = multisigRef.current;
+        if (!m || data.accountId !== m.accountId) return;
+        log.info('broadcast: peer reports update, refreshing');
+        void autoRefresh();
+        return;
+      }
+      if (data.type === 'created') {
+        if (multisigRef.current) return; // already busy with something
+        const profile = activeProfileRef.current;
+        const b = bundleRef.current;
+        if (!profile || !b) return;
+        log.info('broadcast: peer reports new multisig, running discovery', { accountId: data.accountId });
+        void (async () => {
+          try {
+            const matches = await discoverAccountsForProfile(b.multisigClient, profile);
+            if (matches.length === 0) {
+              log.debug('broadcast: discovery found no match for this profile');
+              return;
+            }
+            // Prefer the broadcasted accountId if it's in the discovery
+            // result; otherwise fall back to the first match.
+            const target = (data.accountId && matches.includes(data.accountId)) ? data.accountId : matches[0];
+            // Last-second guard: the user may have created / loaded
+            // something in the brief window between discovery and load.
+            if (multisigRef.current) return;
+            if (activeProfileRef.current?.id !== profile.id) return;
+            const m = await loadMultisig(b.multisigClient, profile, target);
+            if (multisigRef.current) return;
+            if (activeProfileRef.current?.id !== profile.id) return;
+            setMultisig(m);
+            const updated = await updateProfile(profile.id, { lastAccountId: target });
+            if (updated) setProfiles((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+            setStatus(`Auto-loaded ${m.accountId} (cosigner on a peer-created multisig)`);
+            await refresh(m);
+          } catch (e) {
+            log.warn('broadcast: auto-load after create failed', (e as Error).message);
+          }
+        })();
+        return;
+      }
     };
     return () => {
       channel.close();
       if (broadcastRef.current === channel) broadcastRef.current = null;
     };
-  }, [autoRefresh]);
+  }, [autoRefresh, refresh]);
 
   // Visibility-aware polling. Picks up changes from cosigners on other
   // machines (and chain progress) without the user pressing Sync. The poll
@@ -350,7 +407,7 @@ export default function App() {
   // an action.
   useEffect(() => {
     if (!multisig) return;
-    const POLL_MS = 15_000;
+    const POLL_MS = 5_000;
     const tick = () => {
       if (document.visibilityState !== 'visible') return;
       log.debug('auto-refresh poll');
@@ -439,6 +496,9 @@ export default function App() {
       await rememberAccountId(m.accountId);
       setStatus(`Created multisig ${m.accountId}`);
       await refresh(m);
+      // Tell other tabs (cosigners on the same browser) that a new multisig
+      // exists so they can run discovery and auto-load it.
+      notifyOtherTabs('created', m.accountId);
     } catch (e) {
       const err = e as Error;
       log.error('create multisig failed', err);
@@ -547,10 +607,10 @@ export default function App() {
     try {
       const p = await proposeConsumeNotes(multisig, noteIds);
       if (multisigRef.current?.accountId !== multisig.accountId) return;
-      setStatus(`Proposed ${p.id.slice(0, 16)}…`);
+      setStatus(`Proposed ${p.id}`);
       await refresh(multisig);
       if (multisigRef.current?.accountId === multisig.accountId) {
-        notifyOtherTabs(multisig.accountId);
+        notifyOtherTabs('updated', multisig.accountId);
       }
     } catch (e) {
       const err = e as Error;
@@ -568,10 +628,10 @@ export default function App() {
     try {
       await signProposal(multisig, proposalId);
       if (multisigRef.current?.accountId !== multisig.accountId) return;
-      setStatus(`Signed ${proposalId.slice(0, 16)}…`);
+      setStatus(`Signed ${proposalId}`);
       await refresh(multisig);
       if (multisigRef.current?.accountId === multisig.accountId) {
-        notifyOtherTabs(multisig.accountId);
+        notifyOtherTabs('updated', multisig.accountId);
       }
     } catch (e) {
       const err = e as Error;
@@ -587,12 +647,15 @@ export default function App() {
     setBusyKey(`exec:${proposalId}`);
     setError(null);
     try {
-      await executeProposal(multisig, proposalId);
+      await executeProposal(multisig, proposalId, {
+        guardianEndpoint: settings.guardianEndpoint,
+        midenRpcEndpoint: settings.midenRpcUrl,
+      });
       if (multisigRef.current?.accountId !== multisig.accountId) return;
-      setStatus(`Executed ${proposalId.slice(0, 16)}…`);
+      setStatus(`Executed ${proposalId}`);
       await refresh(multisig);
       if (multisigRef.current?.accountId === multisig.accountId) {
-        notifyOtherTabs(multisig.accountId);
+        notifyOtherTabs('updated', multisig.accountId);
       }
     } catch (e) {
       const err = e as Error;

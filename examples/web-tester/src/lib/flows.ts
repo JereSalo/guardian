@@ -10,6 +10,7 @@ import {
 } from '@openzeppelin/miden-multisig-client';
 import { makeSignerFromProfile, type ProfileRecord } from './profiles';
 import { logger } from './log';
+import { cacheFinalizedProposal, loadCachedHistory, mergeHistory } from './historyCache';
 
 const log = logger('flows');
 
@@ -103,7 +104,11 @@ export type SyncResult = {
  * Falls back to `multisig.listProposals()` when the streaming sync fails so the
  * UI can still render whatever was previously cached.
  */
-export async function syncAll(midenClient: MidenClient, multisig: Multisig): Promise<SyncResult> {
+export async function syncAll(
+  midenClient: MidenClient,
+  multisig: Multisig,
+  cacheKeys?: { guardianEndpoint: string; midenRpcEndpoint: string },
+): Promise<SyncResult> {
   const errors: SyncResult['errors'] = [];
 
   log.debug('sync: midenClient.sync()');
@@ -139,17 +144,27 @@ export async function syncAll(midenClient: MidenClient, multisig: Multisig): Pro
     streamed = multisig.listProposals();
   }
   const proposals = streamed.filter((p) => p.status !== 'finalized');
-  // Always read history from the local store. The streamed `syncProposals`
-  // path may quietly skip a finalized proposal whose tx_summary can no longer
-  // be reconstructed (verifyProposalMetadataBinding), but the local entry
-  // still has status === 'finalized' from the prior execute, so listProposals
-  // is the reliable source for the history view.
-  // Newest first via descending nonce - good enough as a chronological proxy
-  // for the tester (we don't track an explicit finalizedAt timestamp).
-  const history = multisig
-    .listProposals()
-    .filter((p) => p.status === 'finalized')
-    .sort((a, b) => b.nonce - a.nonce);
+  // History sources, merged:
+  //   1. Local SDK state (`multisig.listProposals()`): proposals finalized in
+  //      this in-memory instance (i.e. executed during this session).
+  //   2. Persistent localStorage cache (`historyCache`): proposals previously
+  //      finalized by this browser. Survives refresh.
+  // SDK's `proposals` is wiped on every page load (Map() in memory), and
+  // `syncProposals({skipInvalid:true})` deliberately drops finalized deltas
+  // (their tx_summary cannot be reconstructed post-finalization), so without
+  // the cache the History section goes empty after refresh.
+  const live = multisig.listProposals().filter((p) => p.status === 'finalized');
+  // We intentionally do NOT evict cached entries based on the non-finalized
+  // proposals in this batch. `syncProposals` returns the SDK's full in-memory
+  // map (streamed + leftover), so a stale pending object from before another
+  // tab's execute would look like "ghost reappearance" and incorrectly evict
+  // a valid cached finalized entry. Display history is intentionally additive;
+  // the cache is per-browser and ghost-from-rollback scenarios are extremely
+  // rare in practice. See `evictCachedHistory` for an explicit-reset hook.
+  const cached = cacheKeys
+    ? loadCachedHistory(cacheKeys.guardianEndpoint, cacheKeys.midenRpcEndpoint, multisig.accountId)
+    : [];
+  const history = mergeHistory(cached, live);
 
   log.debug('sync: multisig.getConsumableNotes()');
   let notes: ConsumableNote[] = [];
@@ -200,10 +215,34 @@ export async function signProposal(multisig: Multisig, proposalId: string): Prom
   return p;
 }
 
-export async function executeProposal(multisig: Multisig, proposalId: string): Promise<void> {
+export async function executeProposal(
+  multisig: Multisig,
+  proposalId: string,
+  cacheKeys?: { guardianEndpoint: string; midenRpcEndpoint: string },
+): Promise<void> {
   log.info('executeProposal', { proposalId });
   await multisig.executeProposal(proposalId);
   log.info('executeProposal done', { proposalId });
+  // The SDK sets `status = 'finalized'` on the in-memory proposal after
+  // submit succeeds. Snapshot it into the localStorage cache so the History
+  // section still renders it after a page refresh (the SDK's proposals map
+  // does not survive a refresh - see lib/historyCache.ts).
+  if (cacheKeys) {
+    const idLower = proposalId.toLowerCase();
+    const finalized = multisig
+      .listProposals()
+      .find((p) => p.id.toLowerCase() === idLower && p.status === 'finalized');
+    if (finalized) {
+      cacheFinalizedProposal(
+        cacheKeys.guardianEndpoint,
+        cacheKeys.midenRpcEndpoint,
+        multisig.accountId,
+        finalized,
+      );
+    } else {
+      log.warn('executeProposal: finalized proposal not found in listProposals; cache skipped', { proposalId });
+    }
+  }
 }
 
 /**
