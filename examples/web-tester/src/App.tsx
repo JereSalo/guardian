@@ -5,6 +5,8 @@ import type {
   MultisigClient,
   Proposal,
   ConsumableNote,
+  AccountState,
+  VaultBalance,
 } from '@openzeppelin/miden-multisig-client';
 
 import { ProfileBar } from '@/components/ProfileBar';
@@ -31,11 +33,24 @@ import {
   executeProposal,
   unbindAccountKey,
   discoverAccountsForProfile,
+  type SyncResult,
 } from '@/lib/flows';
 import { loadSettings, saveSettings, type Settings as SettingsType } from '@/config';
 import { logger } from '@/lib/log';
 
 const log = logger('App');
+
+type SyncError = SyncResult['errors'][number];
+
+// The Miden client guards against rolling back local state when the chain
+// hasn't yet included the block from our most recent local mutation (e.g.
+// just after executing a proposal). It self-heals on the next sync once
+// the block lands, so we render it as a note instead of a hard error.
+function isInformationalSyncError(e: SyncError): boolean {
+  return e.step === 'syncState' && /Refusing to overwrite local state/i.test(e.message);
+}
+
+const LOCAL_AHEAD_NOTE = 'Local is ahead of chain - will reconcile once the block is included.';
 
 type ClientBundle = {
   midenClient: MidenClient;
@@ -50,7 +65,10 @@ export default function App() {
   const [bundle, setBundle] = useState<ClientBundle | null>(null);
   const [multisig, setMultisig] = useState<Multisig | null>(null);
   const [proposals, setProposals] = useState<Proposal[]>([]);
+  const [history, setHistory] = useState<Proposal[]>([]);
   const [notes, setNotes] = useState<ConsumableNote[]>([]);
+  const [vaultBalances, setVaultBalances] = useState<VaultBalance[]>([]);
+  const [accountState, setAccountState] = useState<AccountState | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [status, setStatus] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
@@ -69,6 +87,14 @@ export default function App() {
   // were busy talking to the Guardian.
   const multisigRef = useRef<Multisig | null>(null);
   useEffect(() => { multisigRef.current = multisig; }, [multisig]);
+  // Same idea for `busyKey`: the auto-refresh effects below read it from a ref
+  // so they don't have to be re-installed every time the user clicks Sign etc.
+  const busyKeyRef = useRef<string | null>(null);
+  useEffect(() => { busyKeyRef.current = busyKey; }, [busyKey]);
+  // BroadcastChannel for instant cross-tab notifications when this user's
+  // own tabs (same browser, same origin) make a state change. Cross-machine
+  // updates are picked up by the visibility-based polling further below.
+  const broadcastRef = useRef<BroadcastChannel | null>(null);
 
   const activeProfile = profiles.find((p) => p.id === activeId) ?? null;
 
@@ -92,7 +118,10 @@ export default function App() {
       setBundle(null);
       setMultisig(null);
       setProposals([]);
+      setHistory([]);
       setNotes([]);
+      setVaultBalances([]);
+      setAccountState(null);
       setBootstrapping(false);
       return;
     }
@@ -104,7 +133,10 @@ export default function App() {
     // the previous profile's account while the new clients spin up.
     setMultisig(null);
     setProposals([]);
+    setHistory([]);
     setNotes([]);
+    setVaultBalances([]);
+    setAccountState(null);
     (async () => {
       try {
         const midenClient = await createMidenClient(settings.midenRpcUrl, activeProfile.midenDbName);
@@ -176,16 +208,19 @@ export default function App() {
             const result = await syncAll(midenClient, m);
             if (cancelled) return;
             setProposals(result.proposals);
+            setHistory(result.history);
             setNotes(result.notes);
-            const summary = `Loaded ${m.accountId} (${result.proposals.length} proposal(s), ${result.notes.length} note(s))`;
-            if (result.errors.length) {
-              const reasons = result.errors.map((e) => `${e.step}: ${e.message}`).join('; ');
-              log.warn('partial sync after auto-load', result.errors);
-              setError(`Partial sync (${result.errors.length} issue(s)): ${reasons}`);
-              setStatus(summary);
-            } else {
-              setStatus(summary);
+            setVaultBalances(result.vaultBalances);
+            if (result.state) setAccountState(result.state);
+            const baseSummary = `Loaded ${m.accountId} (${result.proposals.length} proposal(s), ${result.notes.length} note(s))`;
+            const hard = result.errors.filter((e) => !isInformationalSyncError(e));
+            const hasInfo = result.errors.some(isInformationalSyncError);
+            if (hard.length) {
+              const reasons = hard.map((e) => `${e.step}: ${e.message}`).join('; ');
+              log.warn('partial sync after auto-load', hard);
+              setError(`Partial sync (${hard.length} issue(s)): ${reasons}`);
             }
+            setStatus(hasInfo ? `${baseSummary}. ${LOCAL_AHEAD_NOTE}` : baseSummary);
           } catch (e) {
             const err = e as Error;
             log.error('auto-load failed (hard error from load itself)', err);
@@ -213,20 +248,124 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProfile?.id, settings.guardianEndpoint, settings.midenRpcUrl]);
 
+  const notifyOtherTabs = useCallback((accountId: string) => {
+    broadcastRef.current?.postMessage({ type: 'updated', accountId });
+  }, []);
+
+  // All refreshes - manual and auto - go through this single inflight lock so
+  // their setStates can never race against each other on the same account.
+  // Manual refresh awaits any in-flight work; auto refresh bails entirely.
+  const inflightRefreshRef = useRef<Promise<SyncResult | null> | null>(null);
+
   const refresh = useCallback(async (m: Multisig) => {
     if (!bundle) return null;
-    log.debug('refresh start', { accountId: m.accountId });
-    const result = await syncAll(bundle.midenClient, m);
-    setProposals(result.proposals);
-    setNotes(result.notes);
-    if (result.errors.length) {
-      const reasons = result.errors.map((e) => `${e.step}: ${e.message}`).join('; ');
-      log.warn('refresh: partial sync', result.errors);
-      setError(`Partial sync (${result.errors.length} issue(s)): ${reasons}`);
+    // Wait for any inflight refresh (auto or manual) to finish first so the
+    // setState writes are serialized. Loop because two callers awaiting the
+    // same promise would both resume together and each start a new run -
+    // we keep re-checking until the ref is genuinely clear.
+    while (inflightRefreshRef.current) {
+      try { await inflightRefreshRef.current; } catch { /* swallow */ }
     }
-    log.debug('refresh done', { proposals: result.proposals.length, notes: result.notes.length, errors: result.errors.length });
-    return result;
+    const run = (async () => {
+      log.debug('refresh start', { accountId: m.accountId });
+      const result = await syncAll(bundle.midenClient, m);
+      // If the user unloaded, switched profile or loaded a different account
+      // while we were syncing, drop the result so we don't clobber the new
+      // state with stale data from the previous account.
+      if (multisigRef.current?.accountId !== m.accountId) {
+        log.info('refresh: discarded stale result', {
+          for: m.accountId,
+          current: multisigRef.current?.accountId ?? null,
+        });
+        return result;
+      }
+      setProposals(result.proposals);
+      setHistory(result.history);
+      setNotes(result.notes);
+      // Balances are derived from `state` via AccountInspector. Only refresh
+      // when we have a fresh state AND the inspector succeeded - otherwise
+      // keep the last-good snapshot rather than blanking Balances while the
+      // rest of the card still shows values from an earlier successful sync.
+      const inspectorOk = !result.errors.find((e) => e.step === 'inspector');
+      if (result.state) {
+        setAccountState(result.state);
+        if (inspectorOk) setVaultBalances(result.vaultBalances);
+      }
+      const hard = result.errors.filter((e) => !isInformationalSyncError(e));
+      if (hard.length) {
+        const reasons = hard.map((e) => `${e.step}: ${e.message}`).join('; ');
+        log.warn('refresh: partial sync', hard);
+        setError(`Partial sync (${hard.length} issue(s)): ${reasons}`);
+      }
+      log.debug('refresh done', {
+        proposals: result.proposals.length,
+        history: result.history.length,
+        notes: result.notes.length,
+        balances: result.vaultBalances.length,
+        errors: result.errors.length,
+      });
+      return result;
+    })();
+    inflightRefreshRef.current = run;
+    try {
+      return await run;
+    } finally {
+      if (inflightRefreshRef.current === run) inflightRefreshRef.current = null;
+    }
   }, [bundle]);
+
+  // Auto refresh (broadcast + visibility poll) skips entirely when something
+  // else (manual sync, sign, execute, or another auto tick) is in flight.
+  const autoRefresh = useCallback(async () => {
+    if (inflightRefreshRef.current) return;
+    if (busyKeyRef.current) return;
+    const m = multisigRef.current;
+    if (!m) return;
+    await refresh(m);
+  }, [refresh]);
+
+  // Listen for cross-tab "updated" broadcasts. When another tab (same browser,
+  // same origin) signs/executes/proposes on the same multisig, refresh ours
+  // automatically. Cross-machine updates are covered by the polling effect below.
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
+    const channel = new BroadcastChannel('miden-multisig-sync');
+    broadcastRef.current = channel;
+    channel.onmessage = (ev) => {
+      const data = ev.data as { type?: string; accountId?: string } | null;
+      const m = multisigRef.current;
+      if (!data || data.type !== 'updated' || !m || data.accountId !== m.accountId) return;
+      log.info('broadcast: peer reports update, refreshing');
+      void autoRefresh();
+    };
+    return () => {
+      channel.close();
+      if (broadcastRef.current === channel) broadcastRef.current = null;
+    };
+  }, [autoRefresh]);
+
+  // Visibility-aware polling. Picks up changes from cosigners on other
+  // machines (and chain progress) without the user pressing Sync. The poll
+  // only fires when the tab is visible and the user is not in the middle of
+  // an action.
+  useEffect(() => {
+    if (!multisig) return;
+    const POLL_MS = 15_000;
+    const tick = () => {
+      if (document.visibilityState !== 'visible') return;
+      log.debug('auto-refresh poll');
+      void autoRefresh();
+    };
+    const interval = window.setInterval(tick, POLL_MS);
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') tick();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [multisig, autoRefresh]);
 
   const handleSwitch = (id: string) => {
     log.info('switch profile', { id, name: profiles.find((p) => p.id === id)?.name });
@@ -355,7 +494,10 @@ export default function App() {
     log.info('unloading multisig from profile', { profile: activeProfile.name });
     setMultisig(null);
     setProposals([]);
+    setHistory([]);
     setNotes([]);
+    setVaultBalances([]);
+    setAccountState(null);
     // Free the signer-key → account binding in the local miden-client keystore
     // so that creating or loading a different multisig with this profile does
     // not hit the SDK's "Signer commitment X is already bound to account Y"
@@ -374,13 +516,17 @@ export default function App() {
     setError(null);
     try {
       const result = await refresh(multisig);
+      // If the user unloaded / switched account during the sync, don't
+      // overwrite the new screen's status with a stale "Synced ..." message.
+      if (multisigRef.current?.accountId !== multisig.accountId) return;
       if (result) {
-        const okSteps = ['midenSync', 'syncState', 'syncProposals', 'notes'].filter(
-          (s) => !result.errors.find((e) => e.step === s),
-        );
+        const STEPS = ['midenSync', 'syncState', 'syncProposals', 'notes', 'inspector'] as const;
+        const okSteps = STEPS.filter((s) => !result.errors.find((e) => e.step === s));
+        const hasInfo = result.errors.some(isInformationalSyncError);
         setStatus(
           `Synced. ${result.proposals.length} proposal(s), ${result.notes.length} note(s). ` +
-          `(${okSteps.length}/4 steps ok)`,
+          `(${okSteps.length}/${STEPS.length} steps ok)` +
+          (hasInfo ? `. ${LOCAL_AHEAD_NOTE}` : ''),
         );
       } else {
         setStatus('Synced.');
@@ -400,8 +546,12 @@ export default function App() {
     setError(null);
     try {
       const p = await proposeConsumeNotes(multisig, noteIds);
+      if (multisigRef.current?.accountId !== multisig.accountId) return;
       setStatus(`Proposed ${p.id.slice(0, 16)}…`);
       await refresh(multisig);
+      if (multisigRef.current?.accountId === multisig.accountId) {
+        notifyOtherTabs(multisig.accountId);
+      }
     } catch (e) {
       const err = e as Error;
       log.error('propose failed', err);
@@ -417,8 +567,12 @@ export default function App() {
     setError(null);
     try {
       await signProposal(multisig, proposalId);
+      if (multisigRef.current?.accountId !== multisig.accountId) return;
       setStatus(`Signed ${proposalId.slice(0, 16)}…`);
       await refresh(multisig);
+      if (multisigRef.current?.accountId === multisig.accountId) {
+        notifyOtherTabs(multisig.accountId);
+      }
     } catch (e) {
       const err = e as Error;
       log.error('sign failed', err);
@@ -434,8 +588,12 @@ export default function App() {
     setError(null);
     try {
       await executeProposal(multisig, proposalId);
+      if (multisigRef.current?.accountId !== multisig.accountId) return;
       setStatus(`Executed ${proposalId.slice(0, 16)}…`);
       await refresh(multisig);
+      if (multisigRef.current?.accountId === multisig.accountId) {
+        notifyOtherTabs(multisig.accountId);
+      }
     } catch (e) {
       const err = e as Error;
       log.error('execute failed', err);
@@ -522,7 +680,10 @@ export default function App() {
           multisig={multisig}
           profile={activeProfile}
           proposals={proposals}
+          history={history}
           notes={notes}
+          vaultBalances={vaultBalances}
+          accountState={accountState}
           busyKey={busyKey}
           onSync={handleSync}
           onProposeConsume={handlePropose}

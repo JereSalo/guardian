@@ -1,5 +1,11 @@
 import { useState } from 'react';
-import type { Multisig, Proposal, ConsumableNote } from '@openzeppelin/miden-multisig-client';
+import type {
+  Multisig,
+  Proposal,
+  ConsumableNote,
+  AccountState,
+  VaultBalance,
+} from '@openzeppelin/miden-multisig-client';
 import { Button } from './Button';
 import type { ProfileRecord } from '@/lib/profiles';
 
@@ -7,7 +13,10 @@ type Props = {
   multisig: Multisig;
   profile: ProfileRecord;
   proposals: Proposal[];
+  history: Proposal[];
   notes: ConsumableNote[];
+  vaultBalances: VaultBalance[];
+  accountState: AccountState | null;
   busyKey: string | null;
   onSync: () => void;
   onProposeConsume: (noteIds: string[]) => void;
@@ -21,11 +30,38 @@ function short(hex: string, head = 10, tail = 6): string {
   return `${hex.slice(0, head)}…${hex.slice(-tail)}`;
 }
 
+function formatRelativeTime(iso: string | undefined | null): string {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return iso;
+  const diffMs = Date.now() - t;
+  const sec = Math.round(diffMs / 1000);
+  if (sec < 5) return 'just now';
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return new Date(t).toLocaleString();
+}
+
+function describeProposal(p: Proposal): string {
+  const meta = p.metadata as { proposalType?: string; noteIds?: string[] };
+  const type = meta.proposalType ?? 'unknown';
+  if (type === 'consume_notes' && Array.isArray(meta.noteIds)) {
+    return `consume ${meta.noteIds.length} note(s)`;
+  }
+  return type;
+}
+
 export function MultisigPanel({
   multisig,
   profile,
   proposals,
+  history,
   notes,
+  vaultBalances,
+  accountState,
   busyKey,
   onSync,
   onProposeConsume,
@@ -83,7 +119,43 @@ export function MultisigPanel({
             <span className="text-zinc-500">Guardian:</span>{' '}
             <span className="font-mono text-xs">{short(multisig.guardianCommitment, 16, 8)}</span>
           </div>
+          {accountState && (
+            <div className="pt-2 text-xs text-zinc-500 space-y-0.5">
+              <div>
+                <span>Last synced:</span>{' '}
+                <span className="text-zinc-400" title={accountState.updatedAt}>
+                  {formatRelativeTime(accountState.updatedAt)}
+                </span>
+              </div>
+              <div>
+                <span>Account commitment:</span>{' '}
+                <span className="font-mono text-zinc-400" title={accountState.commitment}>
+                  {short(accountState.commitment, 14, 8)}
+                </span>
+              </div>
+            </div>
+          )}
         </div>
+      </section>
+
+      <section className="border border-zinc-800 rounded p-4 bg-zinc-900/30">
+        <h3 className="text-base font-semibold mb-3">Balances</h3>
+        {vaultBalances.length === 0 ? (
+          <p className="text-zinc-500 text-sm">
+            No vault balances yet. Once you consume a note, the asset shows up here.
+          </p>
+        ) : (
+          <div className="space-y-1.5">
+            {vaultBalances.map((b) => (
+              <div key={b.faucetId} className="flex items-center justify-between text-sm font-mono">
+                <span className="text-zinc-400" title={b.faucetId}>
+                  faucet {short(b.faucetId, 10, 6)}
+                </span>
+                <span className="text-zinc-100">{b.amount.toString()}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="border border-zinc-800 rounded p-4 bg-zinc-900/30">
@@ -126,7 +198,7 @@ export function MultisigPanel({
       </section>
 
       <section className="border border-zinc-800 rounded p-4 bg-zinc-900/30">
-        <h3 className="text-base font-semibold mb-3">Proposals</h3>
+        <h3 className="text-base font-semibold mb-3">Pending proposals</h3>
         {proposals.length === 0 ? (
           <p className="text-zinc-500 text-sm">No pending proposals.</p>
         ) : (
@@ -173,6 +245,28 @@ export function MultisigPanel({
                 </div>
               );
             })}
+          </div>
+        )}
+      </section>
+
+      <section className="border border-zinc-800 rounded p-4 bg-zinc-900/30">
+        <h3 className="text-base font-semibold mb-3">History</h3>
+        {history.length === 0 ? (
+          <p className="text-zinc-500 text-sm">No finalized proposals yet.</p>
+        ) : (
+          <div className="space-y-1.5 text-xs font-mono">
+            {history.map((p) => (
+              <div
+                key={p.id}
+                className="flex items-center justify-between border-b border-zinc-800/60 pb-1.5 last:border-0 last:pb-0"
+              >
+                <span className="text-zinc-500">nonce {p.nonce}</span>
+                <span className="text-zinc-400">{describeProposal(p)}</span>
+                <span className="text-zinc-500" title={p.id}>
+                  {short(p.id, 12, 6)}
+                </span>
+              </div>
+            ))}
           </div>
         )}
       </section>

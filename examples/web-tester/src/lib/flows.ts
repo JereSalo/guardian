@@ -1,10 +1,12 @@
 import { MidenClient, Word } from '@miden-sdk/miden-sdk';
 import {
+  AccountInspector,
   MultisigClient,
   type Multisig,
   type Proposal,
   type ConsumableNote,
   type AccountState,
+  type VaultBalance,
 } from '@openzeppelin/miden-multisig-client';
 import { makeSignerFromProfile, type ProfileRecord } from './profiles';
 import { logger } from './log';
@@ -82,9 +84,16 @@ export async function loadMultisig(
 export type SyncResult = {
   state: AccountState | null;
   proposals: Proposal[];
+  /** Finalized proposals, newest first - shown as History in the UI. */
+  history: Proposal[];
   notes: ConsumableNote[];
+  /** Vault fungible balances derived from the latest AccountState via AccountInspector. */
+  vaultBalances: VaultBalance[];
   /** Per-step soft errors. Caller can show them without dropping the loaded multisig. */
-  errors: { step: 'midenSync' | 'syncState' | 'syncProposals' | 'notes'; message: string }[];
+  errors: {
+    step: 'midenSync' | 'syncState' | 'syncProposals' | 'notes' | 'inspector';
+    message: string;
+  }[];
 };
 
 /**
@@ -117,19 +126,30 @@ export async function syncAll(midenClient: MidenClient, multisig: Multisig): Pro
   }
 
   log.debug('sync: multisig.syncProposals({ skipInvalid: true })');
-  let proposals: Proposal[];
+  let streamed: Proposal[];
   try {
     // `skipInvalid` keeps the batch alive when a single proposal fails
     // verifyProposalMetadataBinding (e.g. corrupted metadata from an older
     // run on the same account). The SDK logs each skip via console.warn.
-    const raw = await multisig.syncProposals({ skipInvalid: true });
-    proposals = raw.filter((p) => p.status !== 'finalized');
+    streamed = await multisig.syncProposals({ skipInvalid: true });
   } catch (e) {
     const msg = (e as Error).message;
     log.warn('syncProposals failed; falling back to listProposals', msg);
     errors.push({ step: 'syncProposals', message: msg });
-    proposals = multisig.listProposals().filter((p) => p.status !== 'finalized');
+    streamed = multisig.listProposals();
   }
+  const proposals = streamed.filter((p) => p.status !== 'finalized');
+  // Always read history from the local store. The streamed `syncProposals`
+  // path may quietly skip a finalized proposal whose tx_summary can no longer
+  // be reconstructed (verifyProposalMetadataBinding), but the local entry
+  // still has status === 'finalized' from the prior execute, so listProposals
+  // is the reliable source for the history view.
+  // Newest first via descending nonce - good enough as a chronological proxy
+  // for the tester (we don't track an explicit finalizedAt timestamp).
+  const history = multisig
+    .listProposals()
+    .filter((p) => p.status === 'finalized')
+    .sort((a, b) => b.nonce - a.nonce);
 
   log.debug('sync: multisig.getConsumableNotes()');
   let notes: ConsumableNote[] = [];
@@ -141,12 +161,29 @@ export async function syncAll(midenClient: MidenClient, multisig: Multisig): Pro
     errors.push({ step: 'notes', message: msg });
   }
 
+  // Vault balances are derived from the most recent successful state fetch.
+  // If syncState failed we leave vaultBalances empty rather than surfacing a
+  // separate error - the syncState error already signals that the snapshot is
+  // stale.
+  let vaultBalances: VaultBalance[] = [];
+  if (state) {
+    try {
+      vaultBalances = AccountInspector.fromBase64(state.stateDataBase64).vaultBalances;
+    } catch (e) {
+      const msg = (e as Error).message;
+      log.warn('AccountInspector failed', msg);
+      errors.push({ step: 'inspector', message: msg });
+    }
+  }
+
   log.info('sync result', {
     proposals: proposals.length,
+    history: history.length,
     notes: notes.length,
+    balances: vaultBalances.length,
     errors: errors.length,
   });
-  return { state, proposals, notes, errors };
+  return { state, proposals, history, notes, vaultBalances, errors };
 }
 
 export async function proposeConsumeNotes(multisig: Multisig, noteIds: string[]): Promise<Proposal> {

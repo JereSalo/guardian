@@ -9,7 +9,7 @@
 import { chromium } from 'playwright';
 import { createHash } from 'node:crypto';
 
-const URL = 'http://localhost:3002/';
+const URL = process.env.URL ?? 'http://localhost:3002/';
 const FAUCET_API = 'https://faucet-api-devnet-miden.eu-central-8.gateway.fm';
 const MINT_AMOUNT = 100;
 const NOTE_POLL_TIMEOUT_S = 240;
@@ -68,7 +68,7 @@ async function clearStorage(page) {
 }
 
 async function openTab(browser, name) {
-  const context = await browser.newContext();
+  const context = await browser.newContext({ ignoreHTTPSErrors: true });
   const page = await context.newPage();
   page.on('console', (msg) => {
     if (msg.type() === 'error' || msg.type() === 'warning') {
@@ -93,9 +93,9 @@ async function createProfile(page, name) {
   }, name, { timeout: 10000 });
   // Wait for the bundle init (Setup panel visible)
   await page.waitForSelector('text=No multisig loaded', { timeout: 30000 });
-  // Extract commitment from the bar
-  const commitment = await page.locator('span.font-mono.text-zinc-400, span.text-xs.text-zinc-400').first().textContent();
-  // The text is "commitment: 0xabc…def"; pull from the active profile via DOM eval instead, more reliable.
+  // Extract the short commitment from the profile bar via DOM eval (more
+  // resilient than a class-based locator, which broke when the bar markup
+  // moved font-mono onto the wrapping button).
   const actualCommitment = await page.evaluate(() => {
     const spans = Array.from(document.querySelectorAll('span'));
     const s = spans.find((el) => el.textContent && el.textContent.includes('commitment:'));
@@ -125,7 +125,7 @@ async function cancelSetup(page) {
   await page.waitForSelector('text=No multisig loaded', { timeout: 5000 });
 }
 
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({ headless: true, ignoreHTTPSErrors: true });
 
 const a = await openTab(browser, 'A');
 const b = await openTab(browser, 'B');
@@ -246,5 +246,91 @@ await clickAndAwaitStatus(c.page, 'C', 'Sync', 'Synced.', 90000);
 await c.page.waitForSelector('button:has-text("Execute"):not([disabled])', { timeout: 30000 });
 await clickAndAwaitStatus(c.page, 'C', 'Execute', 'Executed ', 180000);
 
-console.log('\n✓ Full 2-of-3 flow succeeded end-to-end.');
+// After the Execute, validate the three new UI sections: Balances, History
+// and Account commitment / Last synced. Guardian canonicalization runs every
+// ~10s, so right after Execute the Balances may still be empty (Guardian
+// hasn't picked up the new on-chain state yet). We retry the Sync up to
+// ~90s with a small backoff to give canonicalization time to land.
+async function readNewSections(page, label, { requireHistory }) {
+  const SECTION_POLL_TIMEOUT_S = 90;
+  const deadline = Date.now() + SECTION_POLL_TIMEOUT_S * 1000;
+  let lastErrors = [];
+  let lastSections = null;
+  while (Date.now() < deadline) {
+    await page.click('button:has-text("Sync"):not([disabled])');
+    await page.waitForFunction(() => {
+      const btns = Array.from(document.querySelectorAll('button'));
+      const s = btns.find((x) => x.textContent?.startsWith('Sync'));
+      return s && !s.disabled;
+    }, { timeout: 60000 });
+
+    const sections = await page.evaluate(() => {
+      const headings = Array.from(document.querySelectorAll('h3'));
+      const findSection = (title) =>
+        headings.find((h) => h.textContent?.trim() === title)?.parentElement ?? null;
+      const balancesSection = findSection('Balances');
+      const historySection = findSection('History');
+      const accountCard = document.querySelector('section');
+
+      const balancesText = balancesSection ? balancesSection.innerText : null;
+      const historyText = historySection ? historySection.innerText : null;
+      const accountCardText = accountCard ? accountCard.innerText : null;
+
+      return {
+        hasBalancesSection: !!balancesSection,
+        hasHistorySection: !!historySection,
+        balancesText,
+        historyText,
+        hasAccountCommitment: !!accountCardText?.includes('Account commitment:'),
+        hasLastSynced: !!accountCardText?.includes('Last synced:'),
+      };
+    });
+    lastSections = sections;
+
+    const errors = [];
+    if (!sections.hasBalancesSection) errors.push('Balances section missing');
+    if (!sections.hasHistorySection) errors.push('History section missing');
+    if (!sections.hasAccountCommitment) errors.push('Account commitment line missing');
+    if (!sections.hasLastSynced) errors.push('Last synced line missing');
+    if (sections.balancesText && sections.balancesText.includes('No vault balances yet')) {
+      errors.push(`Balances still empty: ${sections.balancesText.replace(/\s+/g, ' ')}`);
+    }
+    // Only the executor has a reliable local "finalized" entry. For other
+    // tabs the SDK's syncProposals quietly skips updating the local status
+    // (verifyProposalMetadataBinding fails on the post-finalization proposal),
+    // so they would assert forever. We only require History to be populated
+    // on the executor tab.
+    if (requireHistory && sections.historyText && sections.historyText.includes('No finalized proposals yet')) {
+      errors.push(`History still empty: ${sections.historyText.replace(/\s+/g, ' ')}`);
+    }
+    lastErrors = errors;
+    if (errors.length === 0) {
+      log(label, 'sections OK:', JSON.stringify({
+        balances: sections.balancesText?.replace(/\s+/g, ' '),
+        history: sections.historyText?.replace(/\s+/g, ' ').slice(0, 80) + '…',
+      }));
+      return true;
+    }
+    log(label, `assertions not yet ok (${errors.length} pending), retrying in 8s…`);
+    await page.waitForTimeout(8000);
+  }
+  console.error(`[${label}] new-section assertions FAILED after ${SECTION_POLL_TIMEOUT_S}s:`);
+  for (const e of lastErrors) console.error('  -', e);
+  if (lastSections) console.error(`[${label}] last seen:`, JSON.stringify(lastSections, null, 2));
+  return false;
+}
+
+log('main', 'Asserting new sections (Balances / History / account meta)…');
+// Only the executor (C) has a reliably finalized local proposal entry.
+const okA = await readNewSections(a.page, 'A', { requireHistory: false });
+const okB = await readNewSections(b.page, 'B', { requireHistory: false });
+const okC = await readNewSections(c.page, 'C', { requireHistory: true });
+
+if (!okA || !okB || !okC) {
+  console.error('\n✗ New-section assertions failed.');
+  await browser.close();
+  process.exit(1);
+}
+
+console.log('\n✓ Full 2-of-3 flow succeeded end-to-end (including new Balances / History / account meta sections).');
 await browser.close();
