@@ -14,7 +14,12 @@ services:
   postgres:
     image: postgres:16-alpine
     ports:
-      - "5432:5432"
+      # Bind to loopback only. The server reaches Postgres over the Compose
+      # network (DATABASE_URL uses the `postgres` service name), so a published
+      # host port is only for host-side access (psql, benchmarks). Publishing on
+      # 0.0.0.0 would expose the database to the public internet on any host with
+      # a public IP and no firewall.
+      - "127.0.0.1:5432:5432"
     volumes:
       - guardian-postgres:/var/lib/postgresql/data
     environment:
