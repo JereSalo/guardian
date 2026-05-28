@@ -161,7 +161,7 @@ export function MultisigPanel({
       <section className="border border-zinc-800 rounded p-4 bg-zinc-900/30">
         <h3 className="text-base font-semibold mb-3">Consumable notes</h3>
         {notes.length === 0 ? (
-          <p className="text-zinc-500 text-sm">No consumable notes. Mint to the account ID above from the devnet faucet, then click Sync.</p>
+          <p className="text-zinc-500 text-sm">No consumable notes. Mint to the account ID above from the testnet faucet, then click Sync.</p>
         ) : (
           <div className="space-y-2">
             {notes.map((n) => (

@@ -11,7 +11,7 @@ const DEFAULT_SETTINGS: Settings = {
   // For a non-localhost Guardian deployment with CORS enabled, set the
   // absolute URL here.
   guardianEndpoint: '/guardian-proxy',
-  midenRpcUrl: 'https://rpc.devnet.miden.io',
+  midenRpcUrl: 'https://rpc.testnet.miden.io',
 };
 
 export function loadSettings(): Settings {
